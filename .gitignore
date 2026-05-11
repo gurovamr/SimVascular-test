@@ -1,5 +1,7 @@
 # SimVascular generated data
 Results/
+data/
+simvascular/
 Simulations/*/results/
 
 # Large meshes
