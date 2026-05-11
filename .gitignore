@@ -1,0 +1,19 @@
+# SimVascular generated data
+Results/
+Simulations/*/results/
+
+# Large meshes
+*.vtu
+*.vtp
+*.vtk
+
+# Solver outputs
+*.bin
+*.dat
+
+# Logs
+*.log
+
+# OS/editor
+.DS_Store
+.vscode/
