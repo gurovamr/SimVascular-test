@@ -537,18 +537,29 @@ def fill_residual_holes(pd):
 
     for loop in residual_loops:
         coords = np.array([old_pts.GetPoint(pid) for pid in loop])
-        centroid = coords.mean(axis=0)
-        c_id = new_pts.InsertNextPoint(centroid.tolist())
         n = len(loop)
-        for i in range(n):
+        if n == 3:
+            # Single triangle — no centroid needed, avoids MMG duplication
             tri = vtk.vtkIdList()
             tri.SetNumberOfIds(3)
-            tri.SetId(0, c_id)
-            tri.SetId(1, loop[i])
-            tri.SetId(2, loop[(i + 1) % n])
+            tri.SetId(0, loop[0])
+            tri.SetId(1, loop[1])
+            tri.SetId(2, loop[2])
             new_cells.InsertNextCell(tri)
             new_face_arr.InsertNextValue(1)
-        print(f"    Filled residual wall hole: {n} edges")
+            print(f"    Filled residual wall hole: 3 edges (single triangle)")
+        else:
+            centroid = coords.mean(axis=0)
+            c_id = new_pts.InsertNextPoint(centroid.tolist())
+            for i in range(n):
+                tri = vtk.vtkIdList()
+                tri.SetNumberOfIds(3)
+                tri.SetId(0, c_id)
+                tri.SetId(1, loop[i])
+                tri.SetId(2, loop[(i + 1) % n])
+                new_cells.InsertNextCell(tri)
+                new_face_arr.InsertNextValue(1)
+            print(f"    Filled residual wall hole: {n} edges")
 
     new_pd = vtk.vtkPolyData()
     new_pd.SetPoints(new_pts)
@@ -1057,6 +1068,10 @@ def parse_args():
         "--modality", choices=["ct", "mr"], default="ct",
         help="Image modality (ct or mr). Both come from patient p025. Default: ct"
     )
+    parser.add_argument(
+        "--suffix", default="",
+        help="Optional suffix appended to project name, e.g. --suffix _v2 → p025_mr_v2"
+    )
     return parser.parse_args()
 
 
@@ -1075,7 +1090,7 @@ def main():
                                 if mod == "mr"
                                 else f"variant_{mod}_025.json")
 
-    model_name = f"{PATIENT_ID}_{mod}"
+    model_name = f"{PATIENT_ID}_{mod}{args.suffix}"
     mesh_name  = f"{PATIENT_ID}_{mod}_mesh"
     proj_dir   = os.path.join(OUTPUT_BASE, model_name)
 
@@ -1199,6 +1214,31 @@ def main():
     print("  Face map:")
     for fi in face_info:
         print(f"    id={fi['id']:2d}  type={fi['type']:<4s}  name={fi['name']}")
+
+    # ── Normalize triangle winding for MMG compatibility ──────────────────────
+    # MMG discards triangles whose winding is inconsistent with their neighbours,
+    # which can re-open holes we just patched.  vtkPolyDataNormals with
+    # ConsistencyOn fixes all winding to agree with the majority orientation
+    # before we write the file.
+    print("\n── 6b. Normalizing winding order for MMG ─────────────────────────────")
+    saved_face_arr = capped_mesh.GetCellData().GetArray("ModelFaceID")
+
+    normals_filter = vtk.vtkPolyDataNormals()
+    normals_filter.SetInputData(capped_mesh)
+    normals_filter.ConsistencyOn()
+    normals_filter.AutoOrientNormalsOn()
+    normals_filter.SplittingOff()          # keep sharp edges merged
+    normals_filter.ComputePointNormalsOff()
+    normals_filter.ComputeCellNormalsOff()
+    normals_filter.Update()
+    oriented = normals_filter.GetOutput()
+
+    # Re-attach ModelFaceID (normals filter preserves cell data, but verify)
+    if not oriented.GetCellData().GetArray("ModelFaceID") and saved_face_arr:
+        oriented.GetCellData().AddArray(saved_face_arr)
+
+    capped_mesh = oriented
+    print(f"  Done — {capped_mesh.GetNumberOfCells():,} cells, winding normalised")
 
     # ── Create project directory structure ────────────────────────────────────
     print("\n── 7. Creating project structure ─────────────────────────────────────")
