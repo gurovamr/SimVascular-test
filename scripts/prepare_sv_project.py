@@ -95,6 +95,11 @@ INFLOW_MM3_S = {
 DEFAULT_INFLOW      = -333.0   # fallback for unlabelled inlets
 DEFAULT_RESISTANCE  = 1500.0   # dyn·s/cm⁵  — outlet Windkessel resistance
 
+# Per-endpoint sphere radius for dome removal (based on local vessel radius)
+SPHERE_RADIUS_MULTIPLIER = 2.0   # × local vessel mean radius
+SPHERE_RADIUS_MIN_MM     = 1.5   # floor — never smaller than this (mm)
+SPHERE_RADIUS_MAX_MM     = 3.5   # ceiling — avoids cutting through Acom/short bridges
+
 # Face colours (R,G,B) used in the .mdl file for display in SV
 WALL_COLOR = ("0.705882", "0.298039", "0.701961")
 CAP_COLORS = [
@@ -182,6 +187,50 @@ def collect_degree1_nodes(nodes_dict):
     return result
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# Step 0b — Compute per-endpoint dome-removal sphere radii from morphometrics
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def get_endpoint_sphere_radii(degree1_nodes, features):
+    """
+    For each degree-1 endpoint, derive a sphere radius for dome removal from
+    the local vessel mean radius stored in features.json.
+
+        sphere_radius = clamp(SPHERE_RADIUS_MULTIPLIER × vessel_mean_radius,
+                              SPHERE_RADIUS_MIN_MM, SPHERE_RADIUS_MAX_MM)
+
+    Using per-vessel radii avoids over-cutting in thin vessels (e.g. ACA/Acom)
+    whose endpoints may be only a few mm apart.  A single global radius of 4 mm
+    would cut through the Acom bridge between the two ACA tips (~3.4 mm apart).
+
+    Returns dict: node_key → sphere_radius_mm
+    """
+    radii = {}
+    for key, info in degree1_nodes.items():
+        seg_id = info["seg_id"]
+        vessel_radius = 1.5   # mm — fallback if features are missing
+
+        # features keys may be ints or strings depending on the JSON loader
+        seg_feats = features.get(seg_id, features.get(str(seg_id), {}))
+        for feat_type, feat_list in seg_feats.items():
+            if not isinstance(feat_list, list):
+                continue
+            for entry in feat_list:
+                if isinstance(entry, dict) and "radius" in entry:
+                    r = entry["radius"]
+                    if isinstance(r, dict) and "mean" in r:
+                        vessel_radius = float(r["mean"])
+                        break   # first entry per segment is sufficient
+
+        sphere_r = max(SPHERE_RADIUS_MIN_MM,
+                       min(SPHERE_RADIUS_MAX_MM,
+                           SPHERE_RADIUS_MULTIPLIER * vessel_radius))
+        radii[key] = sphere_r
+        # debug: print(f"    {key}: vessel_r={vessel_radius:.2f}  sphere_r={sphere_r:.2f}")
+
+    return radii
+
+
 def compute_endpoint_normals(degree1_nodes, graph_mesh):
     """
     For each degree-1 endpoint, compute an *outward* unit normal
@@ -237,7 +286,7 @@ def compute_endpoint_normals(degree1_nodes, graph_mesh):
 # Step 1 — Cut the closed mesh open at each vessel endpoint
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def cut_mesh_at_endpoints(mesh, endpoint_normals, sphere_radius_mm=4.0):
+def cut_mesh_at_endpoints(mesh, endpoint_normals, sphere_radii=None):
     """
     Remove the terminal dome faces near each vessel endpoint to expose the lumen.
 
@@ -258,10 +307,11 @@ def cut_mesh_at_endpoints(mesh, endpoint_normals, sphere_radius_mm=4.0):
     This is surgical — it only removes faces near the endpoint, leaving the
     rest of the (ring-shaped) CoW wall untouched.
 
-    sphere_radius_mm: search radius around each endpoint.  Should be ~2× the
-                      local vessel radius.  Default 4 mm works for most CoW
-                      vessels (radii 1–3 mm).
+    sphere_radii: dict mapping node_key → radius_mm (from get_endpoint_sphere_radii).
+                  Any key absent from the dict falls back to SPHERE_RADIUS_MAX_MM.
     """
+    if sphere_radii is None:
+        sphere_radii = {}
     n_cells = mesh.GetNumberOfCells()
     mesh_pts = mesh.GetPoints()
     n_pts = mesh.GetNumberOfPoints()
@@ -281,6 +331,7 @@ def cut_mesh_at_endpoints(mesh, endpoint_normals, sphere_radius_mm=4.0):
     keep = np.ones(n_cells, dtype=bool)
 
     for key, (ep_xyz, outward) in endpoint_normals.items():
+        sphere_radius_mm = sphere_radii.get(key, SPHERE_RADIUS_MAX_MM)
         # Signed distance of each centroid from the cutting plane
         # (outward normal, plane passes through ep_xyz)
         disp = centroids - ep_xyz              # (N, 3)
@@ -329,8 +380,11 @@ def find_boundary_loops(mesh):
     """
     Find all open boundary edge loops of a triangle surface mesh.
 
-    Uses vtkFeatureEdges to extract boundary edges, then traces each
-    connected loop using an adjacency walk.
+    Uses vtkFeatureEdges to identify boundary edges, then traces each loop
+    with a vertex-based walk that:
+      - always prefers UNVISITED neighbours (avoids premature termination
+        at T-junction vertices that were reached from a different direction)
+      - closes the loop as soon as `start` is reachable
 
     Returns
     -------
@@ -348,7 +402,7 @@ def find_boundary_loops(mesh):
 
     bnd = feat.GetOutput()
 
-    # Build adjacency map on boundary edges (local point IDs within bnd)
+    # Build adjacency (local boundary mesh point IDs)
     adj = {}
     for ci in range(bnd.GetNumberOfCells()):
         cell = bnd.GetCell(ci)
@@ -358,7 +412,7 @@ def find_boundary_loops(mesh):
             adj.setdefault(p0, set()).add(p1)
             adj.setdefault(p1, set()).add(p0)
 
-    # Trace connected loops
+    # Trace loops
     visited = set()
     loops_local = []
     for start in adj:
@@ -367,22 +421,27 @@ def find_boundary_loops(mesh):
         loop = [start]
         visited.add(start)
         cur, prev = start, None
+
         while True:
-            nbrs = adj.get(cur, set()) - ({prev} if prev is not None else set())
-            if not nbrs:
+            candidates = adj.get(cur, set()) - ({prev} if prev is not None else set())
+            if not candidates:
                 break
-            nxt = next(iter(nbrs))
-            if nxt == start:
+            # Close the loop immediately if start is reachable
+            if start in candidates and len(loop) > 2:
                 break
-            if nxt in visited:
+            # Prefer unvisited neighbours to avoid stopping at T-junctions
+            unvisited = candidates - visited
+            if not unvisited:
                 break
+            nxt = next(iter(unvisited))
             loop.append(nxt)
             visited.add(nxt)
             prev, cur = cur, nxt
+
         if len(loop) >= 3:
             loops_local.append(loop)
 
-    # Map local boundary point IDs → original mesh point IDs via a point locator
+    # Map local boundary IDs → original mesh IDs via coordinate lookup
     locator = vtk.vtkPointLocator()
     locator.SetDataSet(mesh)
     locator.BuildLocator()
@@ -402,64 +461,192 @@ def loop_centroid(mesh, loop):
     return coords.mean(axis=0)
 
 
+def fill_residual_holes(pd):
+    """
+    Fill any open boundary loops that remain after the main fan-cap pass.
+
+    These are small gaps left by the sphere-cut dome removal (e.g. a tiny
+    triangular notch in the vessel wall near a bifurcation).  We detect them
+    by edge-counting directly on the polydata, trace each residual loop, and
+    fill with a fan from the loop centroid — same method as the main caps,
+    so no FillHolesFilter duplicates.
+
+    New fill cells get ModelFaceID = 1 (wall).
+    """
+    # -- count edge occurrences directly on mesh cells --
+    edge_count = {}
+    id_list = vtk.vtkIdList()
+    for ci in range(pd.GetNumberOfCells()):
+        pd.GetCellPoints(ci, id_list)
+        n = id_list.GetNumberOfIds()
+        for j in range(n):
+            p0 = id_list.GetId(j)
+            p1 = id_list.GetId((j + 1) % n)
+            e = (min(p0, p1), max(p0, p1))
+            edge_count[e] = edge_count.get(e, 0) + 1
+
+    bnd_adj = {}
+    for (p0, p1), c in edge_count.items():
+        if c == 1:
+            bnd_adj.setdefault(p0, set()).add(p1)
+            bnd_adj.setdefault(p1, set()).add(p0)
+
+    if not bnd_adj:
+        return pd   # already fully closed
+
+    # -- trace residual boundary loops --
+    visited = set()
+    residual_loops = []
+    for start in sorted(bnd_adj.keys()):
+        if start in visited:
+            continue
+        loop = [start]
+        visited.add(start)
+        cur = next(iter(bnd_adj[start]))
+        while cur != start and cur not in visited:
+            loop.append(cur)
+            visited.add(cur)
+            candidates = bnd_adj[cur] - visited
+            if not candidates:
+                break
+            cur = next(iter(candidates))
+        if len(loop) >= 3:
+            residual_loops.append(loop)
+
+    if not residual_loops:
+        return pd
+
+    # -- fill each residual loop with a centroid fan --
+    old_pts = pd.GetPoints()
+    old_face_arr = pd.GetCellData().GetArray("ModelFaceID")
+
+    new_pts = vtk.vtkPoints()
+    for i in range(old_pts.GetNumberOfPoints()):
+        new_pts.InsertNextPoint(old_pts.GetPoint(i))
+
+    new_cells = vtk.vtkCellArray()
+    new_face_arr = vtk.vtkIntArray()
+    new_face_arr.SetName("ModelFaceID")
+
+    id_list2 = vtk.vtkIdList()
+    for ci in range(pd.GetNumberOfCells()):
+        pd.GetCellPoints(ci, id_list2)
+        new_cells.InsertNextCell(id_list2)
+        fid = int(old_face_arr.GetValue(ci)) if old_face_arr else 1
+        new_face_arr.InsertNextValue(fid)
+
+    for loop in residual_loops:
+        coords = np.array([old_pts.GetPoint(pid) for pid in loop])
+        centroid = coords.mean(axis=0)
+        c_id = new_pts.InsertNextPoint(centroid.tolist())
+        n = len(loop)
+        for i in range(n):
+            tri = vtk.vtkIdList()
+            tri.SetNumberOfIds(3)
+            tri.SetId(0, c_id)
+            tri.SetId(1, loop[i])
+            tri.SetId(2, loop[(i + 1) % n])
+            new_cells.InsertNextCell(tri)
+            new_face_arr.InsertNextValue(1)
+        print(f"    Filled residual wall hole: {n} edges")
+
+    new_pd = vtk.vtkPolyData()
+    new_pd.SetPoints(new_pts)
+    new_pd.SetPolys(new_cells)
+    new_pd.GetCellData().AddArray(new_face_arr)
+    return new_pd
+
+
+    pts = mesh.GetPoints()
+    coords = np.array([pts.GetPoint(pid) for pid in loop])
+    return coords.mean(axis=0)
+
+
 def match_loops_to_nodes(mesh, loops, endpoint_normals, degree1_nodes):
     """
     Match each boundary loop to the closest degree-1 node (inlet/outlet).
 
-    Returns list of matched node names (sanitised for use in filenames/faces),
-    same length as loops.
+    When multiple loops match the same endpoint (caused by over-cutting that
+    fragments the boundary), only the loop closest to that endpoint is kept;
+    the rest are discarded as artefacts.
+
+    Returns
+    -------
+    list of (loop, name) — deduplicated, one entry per unique endpoint.
     """
-    loop_names = []
+    # Score every loop against every endpoint
+    scored = []
     for i, loop in enumerate(loops):
         centroid = loop_centroid(mesh, loop)
         best_name, best_dist = None, float("inf")
-        # Match against endpoint origin coords (more precise than raw node coords)
         for key, (ep_xyz, _) in endpoint_normals.items():
             dist = np.linalg.norm(centroid - ep_xyz)
             if dist < best_dist:
                 best_dist = dist
                 best_name = key
-        # Fall back to degree1 node coords if endpoint_normals is empty
         if best_name is None:
             for key, info in degree1_nodes.items():
                 dist = np.linalg.norm(centroid - info["coords"])
                 if dist < best_dist:
                     best_dist = dist
                     best_name = key
-        loop_names.append(best_name or f"opening_{i}")
-        print(f"    Loop {i}: centroid={centroid.round(1)}  →  '{best_name}'  (dist={best_dist:.1f} mm)")
-    return loop_names
+        scored.append((i, loop, best_name or f"opening_{i}", best_dist, centroid))
+
+    # Deduplicate: for each endpoint key, keep only the loop with smallest dist
+    best_per_key = {}
+    for i, loop, name, dist, centroid in scored:
+        if name not in best_per_key or dist < best_per_key[name][3]:
+            best_per_key[name] = (i, loop, name, dist, centroid)
+
+    discarded = len(loops) - len(best_per_key)
+    if discarded:
+        print(f"    Discarded {discarded} artefact loop(s) "
+              f"(over-cut fragments — reduce sphere_radius_mm if many)")
+
+    result_loops = []
+    result_names = []
+    for i, loop, name, dist, centroid in best_per_key.values():
+        result_loops.append(loop)
+        result_names.append(name)
+        print(f"    Loop → '{name}'  centroid={centroid.round(1)}  dist={dist:.1f} mm")
+
+    return result_loops, result_names
 
 
-def cap_and_label_mesh(mesh, loops, loop_names):
+def add_triangulated_caps(mesh, loops, loop_names):
     """
-    Add flat cap polygons to close all open boundaries of the cut mesh.
+    Add fan-triangulated cap patches to close all open boundary loops.
 
-    All cells are stored in a single vtkPolyData (no append needed),
-    so point IDs remain valid throughout.
+    Unlike a single n-gon polygon per hole, fan triangulation from the loop
+    centroid produces a fully triangulated surface:
+        - 0 non-manifold edges  (each edge shared by exactly 2 triangles)
+        - 0 free edges          (all boundaries closed)
+        - 1 connected region    (as long as the wall is already connected)
+
+    Each cap adds (len(loop)) triangles of the form:
+        (centroid_id, loop[i], loop[i+1 % n])
 
     Face ID conventions
     -------------------
     1       = wall (all original triangle cells)
-    2, 3, … = caps (one per open boundary, named cap_<loop_name>)
+    2, 3, … = caps (one fan patch per open boundary, named cap_<loop_name>)
 
     Returns
     -------
     capped_pd : vtkPolyData
-        New polydata with original triangles + cap polygons.
-        Cell data array "ModelFaceID" is attached.
-    face_info : list of dict
-        [{"id": int, "name": str, "type": "wall"|"cap"}, …]
+    face_info : list of dict  [{"id", "name", "type"}, …]
     """
-    # We share the original point array — no duplication
-    new_pd = vtk.vtkPolyData()
-    new_pd.SetPoints(mesh.GetPoints())
+    # Build a new point array: originals + one centroid per cap
+    new_points = vtk.vtkPoints()
+    old_pts = mesh.GetPoints()
+    for i in range(old_pts.GetNumberOfPoints()):
+        new_points.InsertNextPoint(old_pts.GetPoint(i))
 
-    all_cells = vtk.vtkCellArray()
+    all_cells  = vtk.vtkCellArray()
     face_id_arr = vtk.vtkIntArray()
     face_id_arr.SetName("ModelFaceID")
 
-    # --- original triangles → wall (face ID 1) ---
+    # --- original wall triangles (face ID 1) ---
     orig_polys = mesh.GetPolys()
     orig_polys.InitTraversal()
     id_list = vtk.vtkIdList()
@@ -469,25 +656,63 @@ def cap_and_label_mesh(mesh, loops, loop_names):
 
     face_info = [{"id": 1, "name": "wall", "type": "wall"}]
 
-    # --- cap polygons (one per boundary loop) ---
+    # --- cap fan patches ---
     for cap_idx, (loop, name) in enumerate(zip(loops, loop_names)):
         face_id = cap_idx + 2
-        id_list_cap = vtk.vtkIdList()
-        id_list_cap.SetNumberOfIds(len(loop))
-        for i, pid in enumerate(loop):
-            id_list_cap.SetId(i, pid)
-        all_cells.InsertNextCell(id_list_cap)
-        face_id_arr.InsertNextValue(face_id)
-        face_info.append({
-            "id":   face_id,
-            "name": f"cap_{name}",
-            "type": "cap",
-        })
 
+        # Centroid of this loop → new point
+        coords = np.array([old_pts.GetPoint(pid) for pid in loop])
+        centroid = coords.mean(axis=0)
+        centroid_id = new_points.InsertNextPoint(centroid.tolist())
+
+        # Fan triangles: (centroid, loop[i], loop[i+1])
+        n = len(loop)
+        for i in range(n):
+            p0 = loop[i]
+            p1 = loop[(i + 1) % n]
+            tri = vtk.vtkIdList()
+            tri.SetNumberOfIds(3)
+            tri.SetId(0, centroid_id)
+            tri.SetId(1, p0)
+            tri.SetId(2, p1)
+            all_cells.InsertNextCell(tri)
+            face_id_arr.InsertNextValue(face_id)
+
+        face_info.append({"id": face_id, "name": f"cap_{name}", "type": "cap"})
+        print(f"    cap '{name}': {n} triangles  (fan from centroid {centroid.round(1)})")
+
+    new_pd = vtk.vtkPolyData()
+    new_pd.SetPoints(new_points)
     new_pd.SetPolys(all_cells)
     new_pd.GetCellData().AddArray(face_id_arr)
 
-    return new_pd, face_info
+    # Merge coincident/near-coincident vertices, remove degenerate cells.
+    # Tolerance 1e-6 (relative) ≈ sub-nanometre for a 30 mm structure —
+    # safe against floating-point noise while never merging distinct mesh points.
+    cleaner = vtk.vtkCleanPolyData()
+    cleaner.SetInputData(new_pd)
+    cleaner.SetTolerance(1e-6)
+    cleaner.Update()
+    cleaned = cleaner.GetOutput()
+
+    # Verify no free edges remain; fill any residual wall holes via our own
+    # centroid-fan method (NOT vtkFillHolesFilter — it creates duplicate facets).
+    feat_check = vtk.vtkFeatureEdges()
+    feat_check.SetInputData(cleaned)
+    feat_check.BoundaryEdgesOn()
+    feat_check.FeatureEdgesOff()
+    feat_check.ManifoldEdgesOff()
+    feat_check.NonManifoldEdgesOff()
+    feat_check.Update()
+    n_open = feat_check.GetOutput().GetNumberOfCells()
+    if n_open > 0:
+        print(f"    NOTE: {n_open} free edge(s) remain — "
+              f"filling residual wall holes")
+        cleaned = fill_residual_holes(cleaned)
+    else:
+        print(f"    Surface is fully closed (0 free edges)")
+
+    return cleaned, face_info
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -900,11 +1125,40 @@ def main():
     for key, (ep_xyz, outward) in sorted(endpoint_normals.items()):
         print(f"  {key:<35s}  outward={outward.round(3)}")
 
+    # ── Determine per-endpoint sphere radii from morphometrics ────────────────
+    print("\n── 3b. Per-endpoint dome-removal sphere radii ────────────────────────")
+    sphere_radii = get_endpoint_sphere_radii(degree1_nodes, features)
+    for key, r in sorted(sphere_radii.items()):
+        print(f"  {key:<35s}  sphere_r={r:.2f} mm")
+
     # ── Cut the closed mesh open at each endpoint ─────────────────────────────
     print("\n── 4. Cutting closed mesh at vessel terminations ─────────────────────")
     print(f"  Input : {mesh.GetNumberOfPoints():,} pts (closed surface)")
-    open_mesh = cut_mesh_at_endpoints(mesh, endpoint_normals)
+    open_mesh = cut_mesh_at_endpoints(mesh, endpoint_normals, sphere_radii)
     print(f"  Output: {open_mesh.GetNumberOfPoints():,} pts (open surface)")
+
+    # Eliminate isolated dome-cut fragments before loop-finding.
+    # Near bifurcations the sphere can leave small disconnected patches;
+    # keeping only the largest connected component removes them cleanly.
+    conn_open = vtk.vtkPolyDataConnectivityFilter()
+    conn_open.SetInputData(open_mesh)
+    conn_open.SetExtractionModeToAllRegions()
+    conn_open.Update()
+    n_open_regions = conn_open.GetNumberOfExtractedRegions()
+    if n_open_regions > 1:
+        print(f"  NOTE: {n_open_regions} regions in open mesh — "
+              f"keeping largest (discarding bifurcation dome fragments)")
+        conn_open.SetExtractionModeToLargestRegion()
+        conn_open.Update()
+        open_mesh = conn_open.GetOutput()
+        # Re-clean after extraction to remove unreferenced points
+        cl2 = vtk.vtkCleanPolyData()
+        cl2.SetInputData(open_mesh)
+        cl2.SetTolerance(1e-6)
+        cl2.Update()
+        open_mesh = cl2.GetOutput()
+    else:
+        print(f"  Connectivity: {n_open_regions} region (OK)")
 
     # ── Find boundary loops of the now-open mesh ──────────────────────────────
     print("\n── 5. Finding open boundary loops ────────────────────────────────────")
@@ -915,13 +1169,33 @@ def main():
         print("           the mesh bounds and increase cut_offset_mm if needed.")
 
     loop_names = (match_loops_to_nodes(open_mesh, loops, endpoint_normals, degree1_nodes)
-                  if loops else [])
+                  if loops else ([], []))
+    loops, loop_names = loop_names  # unpack (deduplicated loops, names)
 
-    # ── Cap the open boundaries with flat faces ────────────────────────────────
-    print("\n── 6. Capping open boundaries ────────────────────────────────────────")
-    capped_mesh, face_info = cap_and_label_mesh(open_mesh, loops, loop_names)
+    # ── Cap the open boundaries with fan-triangulated patches ─────────────────
+    print("\n── 6. Capping open boundaries (fan triangulation) ────────────────────")
+    capped_mesh, face_info = add_triangulated_caps(open_mesh, loops, loop_names)
     print(f"  Capped mesh : {capped_mesh.GetNumberOfCells():,} cells total "
           f"(1 wall + {len(loops)} cap{'s' if len(loops) != 1 else ''})")
+
+    # Connectivity sanity-check — TetGen needs exactly 1 region
+    conn_filter = vtk.vtkPolyDataConnectivityFilter()
+    conn_filter.SetInputData(capped_mesh)
+    conn_filter.SetExtractionModeToAllRegions()
+    conn_filter.Update()
+    n_regions = conn_filter.GetNumberOfExtractedRegions()
+    if n_regions == 1:
+        print(f"  Connectivity: {n_regions} region (OK)")
+    else:
+        print(f"  WARNING: {n_regions} disconnected regions — keeping largest region only")
+        conn_filter.SetExtractionModeToLargestRegion()
+        conn_filter.Update()
+        # Re-attach ModelFaceID from capped_mesh by transferring cell data
+        capped_mesh = conn_filter.GetOutput()
+        if not capped_mesh.GetCellData().GetArray("ModelFaceID"):
+            print("  WARNING: ModelFaceID array lost after region extraction — "
+                  "reduce SPHERE_RADIUS_MAX_MM and re-run")
+
     print("  Face map:")
     for fi in face_info:
         print(f"    id={fi['id']:2d}  type={fi['type']:<4s}  name={fi['name']}")
